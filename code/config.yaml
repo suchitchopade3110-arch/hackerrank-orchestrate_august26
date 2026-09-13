@@ -1,0 +1,116 @@
+# Pinned modelling decisions (design.md §3) plus corrections from the real
+# schema probe (roadmap doc §0). Every key below is actually read by the
+# code (verified by grep against every load_config() call site) --
+# flipping one is a config edit + a re-score, not a refactor. Six facts
+# that used to live here as "reference only" prose (closed implementation
+# details, never loaded) moved to docs/design.md §17 per a second review's
+# finding that a config file where the reader can't tell a wired key from
+# documentation is worse than no config file at all.
+
+income:
+  # Confirmed salary lands on its settlement date. recurring_projected also
+  # projects further occurrences from that user's own observed cadence;
+  # confirmed_only stops at the one confirmed row. Winner picked on measured
+  # sample accuracy — see evaluation/ablations.md §1.
+  mode: recurring_projected
+
+recurring:
+  anchor: last_observed
+  # Variable-expense model (code/evaluation/fit.py grid search, evaluation/
+  # ablations.md §11-13): for each category that rarely forms a clean per-
+  # description cadence (groceries/transport/dining by default), an
+  # amount_rule from {last, mean, median, max, p75, mean_plus_k_stdev} and
+  # an occurrence_rule from {observed_cadence, weekly_anchored,
+  # category_level_cadence, daily_drip}. observed_cadence defers entirely
+  # to the normal per-description detection; the other three replace it
+  # with one category-wide aggregate event. daily_drip steps one day at a
+  # time, amount scaled by daily_drip_fraction of the category's historic
+  # daily rate. Swept both uniformly (§12) and per-category independently
+  # (§13, 216-point grid) -- the ceiling on amount_safe_to_pay didn't move
+  # either way (stuck at 4/25), so this knob is not the dominant lever on
+  # that metric; see ablations.md §13 for the honest finding.
+  variable_expense_categories: [groceries, transport, dining]
+  variable_expense_model:
+    groceries: {amount_rule: max, occurrence_rule: daily_drip}
+    transport: {amount_rule: max, occurrence_rule: daily_drip}
+    dining: {amount_rule: max, occurrence_rule: daily_drip}
+  k_stdev: 1.0
+  # Re-swept after reinstating daily_drip (fit.py, ablations.md §12): 0.2 is
+  # the current pipeline's actual best (37/75) on the 25-sample exact-match
+  # metric. A second review suspected amount_rule: max (charging every user
+  # their historical maximum in three categories, every day) as the cause
+  # of the full-250-row run's elevated not_affordable share, and asked for
+  # a re-sweep toward mean/median checked against distribution, not just
+  # exact match -- ablations.md §14 ran exactly that (full 250 rows, max vs
+  # mean vs median, both with and without daily_drip) and found IDENTICAL
+  # status/method distributions across all three amount_rules. amount_rule
+  # is not the lever on not_affordable share; see §14 for what the actual
+  # not_affordable share is and where the real 25-sample ceiling sits.
+  daily_drip_fraction: 0.2
+
+horizon:
+  days: 90
+  # Tail breaches (strictly past the window) are logged (audit trace) but
+  # do NOT demote a candidate by default -- flipping this to true makes
+  # engine/simulate.py treat any tail breach as infeasible instead.
+  enforce_outside: false
+
+spending_changes:
+  max_changes: 3  # engine/candidates.py
+
+perception:
+  # Exactly 16 blank-amount rows / 16 images, 1:1 via images.csv.related_event_id.
+  #
+  # groq carries no vision-capable model on this account (verified via
+  # client.models.list()) -- gemini goes first for real accuracy; groq
+  # stays listed so it activates automatically if that changes.
+  vlm_provider_order: [gemini, groq]
+  vlm_confidence_threshold: 0.6
+  message_confidence_threshold: 0.6
+  # Measured in ablations.md against the 25 samples: message amendments
+  # on vs off. Flip to false if they measurably hurt score -- the whole
+  # ledger stays correct either way since amendments only ever narrow an
+  # already-closed schema over an event-ID allowlist.
+  enable_message_amendments: true
+
+models:
+  # Verified against THIS account via client.models.list() -- no GROQ
+  # vision model is available, so gemini is primary for images. Gemini's
+  # free tier is 20 requests/day PER MODEL (confirmed from a 429 body), so
+  # `model` is a rotation list, tried in order on a quota error, not a
+  # single name -- keep this list in sync with what the account actually
+  # has (a stale single model name here previously silently drifted from
+  # what perception/vlm.py's own hardcoded rotation used).
+  vlm:
+    provider: gemini
+    model: [gemini-3.6-flash, gemini-flash-lite-latest, gemini-3.1-flash-lite]
+    temperature: 0
+    max_tokens: 128
+  vlm_fallback:
+    provider: groq
+    model: meta-llama/llama-4-scout-17b-16e-instruct
+    temperature: 0
+    max_tokens: 128
+  text:
+    # GROQ's llama-3.3-70b-versatile isn't on this account either;
+    # openai/gpt-oss-120b is. It's a reasoning model -- reasoning tokens
+    # count against max_tokens, hence the larger budgets below.
+    provider: groq
+    model: openai/gpt-oss-120b
+    temperature: 0
+    max_tokens_amendments: 4000
+    max_tokens_explanation: 4000
+    # 25, not 15 (roadmap-review Tier-3): fewer total explanation requests
+    # for the same 250 rows (10 batches instead of 17) -- this account's
+    # observed failure mode after clearing the cache was almost every batch
+    # past the first one failing outright, consistent with a per-minute/
+    # per-day REQUEST-COUNT cap on the free tier rather than the 200,000 TPD
+    # token budget (this run's total usage was far under that). Fewer
+    # requests is the lever that actually addresses a request-count cap;
+    # a bounded retry-with-backoff (perception/messages.py, explain/
+    # generate.py) covers the transient case on top of it.
+    explanation_batch_size: 25
+
+cache:
+  dir_env: BUYORWAIT_CACHE_DIR
+  default_dir: .cache
